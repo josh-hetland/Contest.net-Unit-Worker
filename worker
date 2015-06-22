@@ -1,0 +1,1470 @@
+#!/usr/bin/perl
+
+use 5.014;
+use strict;
+use warnings;
+
+
+### ---------------------------- Application Constants ----------------------------- ###
+use constant {
+  ApplicationRoot => '/opt/contestnet',     ## Application directory root
+  ApplicationBin  => '/opt/contestnet/bin', ## Application Executables directory
+  ApplicationLib  => '/opt/contestnet/lib', ## Application Executable resources directory
+  ApplicationVar  => '/opt/contestnet/var', ## Application content directory
+  ApplicationEtc  => '/opt/contestnet/etc', ## Application configuration directory
+  ApplicationLog  => '/opt/contestnet/log'  ## Application log directory
+};
+use constant {
+  SigStatusRequest => 'NUM50',
+  SigTaskReady     => 'NUM51',
+  SigScheduleReady => 'NUM53',
+  SigExitRequest   => 'TERM'
+};
+use constant {
+  TaskWebsite   => 1,
+  TaskSlideshow => 2,
+  TaskVideo     => 3
+};
+use constant {
+  CommandShutdown => 1,
+  CommandRestart  => 2,
+  CommandExecute  => 4
+};
+
+
+### ----------------------------------- Includes ----------------------------------- ###
+use lib (ApplicationLib);
+use Logger;
+use IO::File;
+use threads;
+use threads::shared;
+use Thread::Queue;
+
+
+### ------------------------------------ Exports ----------------------------------- ###
+our $VERSION = '1.0.0';
+
+
+
+### -------------------------------------------------------------------------------- ###
+### ------------------------------ Primary Execution ------------------------------- ###
+### -------------------------------------------------------------------------------- ###
+my $TaskQueue;        ## Queue object for passing task details from the maintenance to display thread
+my $ScheduleQueue;    ## Queue object for passing schedule details from the maintenance to display thread
+my $CurrentTaskQueue; ## Queue object for passing current task details from the display to maintenance thread
+
+if( ! caller ){ exit( Main()); }
+
+
+### [Main]:
+###   Primary thread entry point
+sub Main {
+  my $oMaintenanceThread;
+  my $oDisplayThread;
+  my $iReturn = 0;
+  
+  my $iTerminalId = 0;
+  my $iDebugMode  = 0;
+  
+  
+  ### -------------------------- Parse Configuration File -------------------------- ###
+  eval{
+    my $hConfigurationFile = IO::File->new(ApplicationEtc . '/contestnet.conf','r');
+    if( defined($hConfigurationFile) ){
+      while(my $sLine = <$hConfigurationFile>){
+        chomp($sLine);    ## Remove carriage return
+        $sLine =~ s/\s//; ## Strip any whitespace so we end up with a mashed key value pair or a line that starts with a #
+        if( $sLine !~ /^#/ && $sLine =~ /=/ ){ ## Only process lines that don't start with a comment and do have an = in them
+          my @ConfigOption = split('=', $sLine);
+          
+          ### ---------------------------- Terminal Id ----------------------------- ###
+          if(lc($ConfigOption[0]) eq 'id'){
+            $iTerminalId = $ConfigOption[1];
+          }
+          
+          ### ----------------------------- Debug Mode ----------------------------- ###
+          elsif(lc($ConfigOption[0]) eq 'debug'){
+            if(lc($ConfigOption[1]) eq 'true'){
+              $iDebugMode = 1;
+            }
+          }
+        }## None-comment key=value pair line
+        
+        
+      }##next $sLine
+      $hConfigurationFile->close();
+    }
+    undef($hConfigurationFile);
+    
+    1;
+  }or do{};
+  ### ------------------------------------------------------------------------------ ###
+  
+  
+  ## Set up the golden logger object to be shared
+  my $gLog = Logger->new();
+  $gLog->FileLogging($iDebugMode); ## Enable file logging if debug mode is set
+  $gLog->ConsoleLogging(0);
+  $gLog->MaxSize('10mb');
+  $gLog->FilePath(ApplicationLog . '/contestnet.log');
+  my $oLog :shared = shared_clone($gLog);
+  bless($oLog,'Logger');
+  
+  $TaskQueue        = Thread::Queue->new(); ## Queue used by Maintenance to pass task information to Display
+  $ScheduleQueue    = Thread::Queue->new(); ## Queue used by Maintenance to pass schedule information to Display
+  $CurrentTaskQueue = Thread::Queue->new(); ## Queue used by Display to pass current task information to Maintenance
+  
+  $oLog->WriteLine('Main(): Version [ ' . $VERSION . ' ] Spawning workers');
+  $oMaintenanceThread = threads->create(\&MaintenanceMain, $oLog, $iTerminalId);
+  $oDisplayThread     = threads->create(\&DisplayMain,     $oLog);
+  
+  ### Wait for the threads to end and then join them
+  while(threads->list(threads::running)){
+    sleep 1;
+  }
+  
+  $oDisplayThread->join();                ## void context, don't care about exit code
+  $oLog->WriteLine('Main(): Display thread had exited.');
+  $iReturn = $oMaintenanceThread->join(); ## catch the exit code of the thread to determine what is happening
+  $oLog->WriteLine('Main(): Maintenance thread has exited with code [ ' . $iReturn . ' ]');
+  
+  ## Clean up any remaining process monitor threads that may be waiting (there shouldn't be)
+  foreach my $oThread ( threads->list(threads::joinable) ){
+    $oThread->join();
+  }#next $oThread
+  
+  $oLog->WriteLine('Main(): Execution complete.');
+  $oLog->WriteBlankLines(2);
+  
+  return $iReturn;
+}
+### Main
+
+
+
+
+
+
+
+
+
+
+### -------------------------------------------------------------------------------- ###
+### ------------------------------ Maintenance Thread ------------------------------ ###
+### -------------------------------------------------------------------------------- ###
+
+### ---------------------------- Thread Global Variables --------------------------- ###
+my $MaintenanceLog             = undef; ## Holds an instance of the logger object for access by handler functions
+my $MaintenanceApiUrlBase      = undef; ## Base url for connections to the API
+my $MaintenanceTerminalId      = 0;     ## Holds the terminal Id used for identifying this unit to the server
+my $MaintenanceCheckinInterval = 300;   ## Holds the number of seconds the maintenance thread will sleep between checkins
+
+
+
+### [MaintenanceMain]:
+###   Maintenance thread (background worker) entry point
+sub MaintenanceMain { #( $oLog, $iTerminalId )
+  ### -------------------------- Thread Specific Includes -------------------------- ###
+  require LWP::UserAgent;        LWP::UserAgent->import(); ## Installed via apt-get
+  require HTTP::Request;         HTTP::Request->import();
+  require HTTP::Request::Common; HTTP::Request::Common->import();
+  require URI::Escape;           URI::Escape->import();
+  require JSON;                  JSON->import();
+  require IO::File;              IO::File->import();
+  require version;               version->import();
+  require Digest::MD5;           Digest::MD5->import();
+  require File::Path;            File::Path->import();
+  require IO::Interface::Simple; IO::Interface::Simple->import(); ## Installed via CPAN
+  
+  ### ----------------------- Thread Specific Event Handlers ----------------------- ###
+  $SIG{(SigExitRequest)}   = \&MaintenanceExitHandler;   ## Bind the event handler for exit requests
+  $SIG{(SigTaskReady)}     = sub { return 1; };          ## Empty handler incase this thread gets a signal it isn't supposed to
+  $SIG{(SigScheduleReady)} = sub { return 1; };
+  $SIG{(SigStatusRequest)} = sub { return 1; };          ## Empty handler incase this thread gets a signal it isn't supposed to
+  
+  $MaintenanceLog        = shift @_; ## Store the logger object in the thread global spot for other functions
+  $MaintenanceTerminalId = shift @_; ## Store the terminal id in the thread global spot for other functions
+  
+  my $oLog    = $MaintenanceLog;     ## Get a local copy of the logger object for use in this function
+  my $iReturn = 0;                   ## Set the default return value
+  
+  $oLog->WriteLine('MaintenanceMain(): Maintenance thread started');
+  $oLog->WriteLine('MaintenanceMain():   Terminal Id [ ' . $MaintenanceTerminalId . ' ]');
+  
+  $MaintenanceCheckinInterval = 300; ## Check in every 5 minutes
+  
+  ## It will always talk to the same server so it can probably only make the object once so long as there aren't any memory leaks
+  my $oClient = LWP::UserAgent->new();
+  $oClient->ssl_opts(verify_hostname => 0); ## Disables checking
+  
+  $MaintenanceApiUrlBase = 'https://api.contestnet.us/terminals/';
+  
+  $oLog->WriteLine('MaintenanceMain(): API Address [ ' . $MaintenanceApiUrlBase . $MaintenanceTerminalId . ' ]');
+  $oLog->WriteLine('MaintenanceMain(): Beginning maintenace loop');
+  
+  ## Start Checkin loop
+  ## Exit statements meant to terminate the loop should use the explicit name to ensure the proper loop is exited
+  MAINTENANCELOOP: while(1){
+    $oLog->WriteLine('MaintenanceMain(): Checking in with server');
+    my $oPutRequest = HTTP::Request::Common::POST(
+      $MaintenanceApiUrlBase . $MaintenanceTerminalId, ## Url
+      {
+        'SoftwareVersion'  => MaintenanceClientVersion(),
+        'Uptime'           => MaintenanceClientUptime(),
+        'AvailableMemory'  => MaintenanceClientAvailableMemory(),
+        'AvailableSpace'   => MaintenanceClientAvailableSpace(),
+        'WirelessQuality'  => MaintenanceClientWirelessQuality(),
+        'WirelessStrength' => MaintenanceClientWirelessStrength(),
+        'LocalAddress'     => MaintenanceClientLocalAddress(),
+        'CurrentTaskId'    => MaintenanceClientCurrentTaskId()
+      }
+    );
+    $oPutRequest->method('PUT');
+    my $oPutResponse = $oClient->request( $oPutRequest );
+    
+    $oLog->WriteLine('MaintenanceMain(): Checkin responded [ ' . $oPutResponse->code() . ' ]');
+    $oLog->WriteLine('MaintenanceMain(): With message body [ ' . $oPutResponse->decoded_content() . ' ]');
+    
+    $oLog->WriteLine('MaintenanceMain(): Requesting instructions from server.');
+    my $oGetResponse = $oClient->get( $MaintenanceApiUrlBase . $MaintenanceTerminalId );
+    $oLog->WriteLine('MaintenanceMain(): Instruction query responded [ ' . $oGetResponse->code() . ' ]');
+    
+    
+    ### ------------------------------ Response Check ------------------------------ ###
+    if( $oGetResponse->code() != 200 ){
+      ## The server did not respond with instructions. One of two things happened
+      ## 1) This is an unknown terminal so it responded with a 404, The checkin should have worked so i can figure out why
+      ##    but this will probably need some troubleshooting, i'm guessint it is set as Id 0
+      ## 2) Something is wrong with the server right now, we'll try again later
+      $oLog->WriteLine('MaintenanceMain(): Server did not respond with instructions for this terminal. Will check back again later.');
+      next;
+    }
+    
+    
+    ### This may cause the loop to restart from here
+    if ( ! $oGetResponse->header('content-type') eq 'application/json') {
+      ## don't know how to handle anything but json, need to keep trying
+      ## should sleep here so it doesn't get skipped
+      $oLog->WriteLine('MaintenanceMain(): server did not respond in a recognized format. type [ '. $oGetResponse->header('content-type') .' ]');
+      next;
+      ## an empty response that still has a content type of application/json causes the thread to crash
+    }
+    ### ---------------------------------------------------------------------------- ###
+    
+    my $oInstructions = JSON::decode_json( $oGetResponse->decoded_content() );
+    $oLog->WriteLine('MaintenanceMain(): Translated data structure type [ ' . ref($oInstructions) . ' ]');
+    ## i could check if this is a json object what ever this ends up being on a good check should be
+    ## what it looks for, if this isn't working it will keep checking in but not updating
+    ## this would probably be hard to detect since it can't do anything past this point if this fails
+    ## but if i can keep the thread alive at least i have a chance of fixing it. this is a server side problem
+    ## after all
+    
+    ### ------------------------- Software Check / Update -------------------------- ###
+    ### This may cause the loop to exit (in the event of an update)
+    ### or to restart (in the event of a failed update)
+    $oLog->WriteLine('MaintenanceMain(): Checking latest software version available on server against self.');
+    $oLog->WriteLine('MaintenanceMain():   Server Version: [ ' . $oInstructions->{Software}->{Version} . ' ]');
+    $oLog->WriteLine('MaintenanceMain():   Client Version: [ ' . MaintenanceClientVersion() . ' ]');
+    if ( version->parse($oInstructions->{Software}->{Version}) > version->parse(MaintenanceClientVersion()) ) {
+      eval{
+        $oLog->WriteLine('MaintenanceMain(): Newer version found on server. Updating client software.');
+        $oClient->get( $oInstructions->{Software}->{Uri}, ':content_file' => ApplicationBin . '/worker.new');
+        chmod( 771, ApplicationBin . 'worker.new'); ## Set rwx,rwx,x
+        
+        $oLog->WriteLine('MaintenanceMain(): Checking consistancy of downloaded file.');
+        my $sSoftwareChecksum = MaintenanceGetResourceChecksum(ApplicationBin . '/worker.new');
+        
+        $oLog->WriteLine('MaintenanceMain(): Expected Checksum [ ' . ($oInstructions->{Software}->{Checksum} // 'Not Specified') . ' ]');
+        $oLog->WriteLine('MaintenanceMain():   Actual Checksum [ ' . $sSoftwareChecksum . ' ]');
+        if( $sSoftwareChecksum ne $oInstructions->{Software}->{Checksum} ){
+          die('Checksum mismatch, the retrieved file does not match what the server sent.');
+        }
+        
+        $oLog->WriteLine('MaintenanceMain(): A software update is ready to be applied, exiting the maintenance loop to trigger the update.');
+        $iReturn = 0;         ## Set clean exit code
+        last MAINTENANCELOOP; ## jump out of the while loop
+                              ## which will shut everything down and exit out to launcher so it can update the software
+        
+        1;
+      }or do{
+        my $e = $@;
+        $oLog->WriteLine('MaintenanceMain(): Error encountered durning software update.');
+        $oLog->WriteLine('MaintenanceMain(): Message: [ ' . $e . ' ]');
+        $oLog->WriteLine('MaintenanceMain(): cleaning up local environment.');
+        if( ! unlink(ApplicationBin . '/worker.new') ) {
+          $oLog->WriteLine('MaintenanceMain(): double shit... failed to delete the corrupt software update file, hopefully launcher will recover.');
+          $oLog->WriteLine('MaintenanceMain(): Message: [ ' . $! . ' ]');
+        }
+        
+        next; ## Go to sleep and wait for 
+      };
+    }##New Software Available
+    ### ---------------------------------------------------------------------------- ###
+    
+    
+    ### ------------------------ Interval Update Processing ------------------------ ###
+    if ( defined($oInstructions->{Interval}) && ( $oInstructions->{Interval} >= 60 ) ){    
+      $oLog->WriteLine('MaintenanceMain(): Setting interval value to [ ' . $oInstructions->{Interval} . ' ] from server.');
+      $MaintenanceCheckinInterval = $oInstructions->{Interval}; 
+    }else{
+      $oLog->WriteLine('MaintenanceMain(): Skipping interval update from server because the value [ ' . $oInstructions->{Interval} . ' ] is outside of the allowed range')
+    }
+    ### ---------------------------------------------------------------------------- ###
+    
+    
+    ### ---------------------------- Command Processing ---------------------------- ###
+    if( defined($oInstructions->{Commands}) ){
+      $oLog->WriteLine('MaintenanceMain(): Processing [ ' . scalar(@{$oInstructions->{Commands}}) . ' ] commands issued by the server.');
+      foreach my $oCommand ( @{$oInstructions->{Commands}} ){
+        my $sApiCommandUrl = $MaintenanceApiUrlBase . $MaintenanceTerminalId . '/commands/' . $oCommand->{Id};
+        
+        $oLog->WriteLine('MaintenanceMain(): Command Id [ ' . $oCommand->{Id} . ' ] Type [ ' . $oCommand->{TypeCode} . ' ]');
+        $oLog->WriteLine('MaintenanceMain(): Command Url [ ' . $sApiCommandUrl . ' ]');
+        
+        ### --------------------------- Shutdown Command --------------------------- ###
+        if( $oCommand->{TypeCode} == CommandShutdown ){
+          $oLog->WriteLine('MaintenanceMain(): Processing [ Shutdown ] command.');
+          $oLog->WriteLine('MaintenanceMain(): Sending acknowledgement to the server.');
+          my $oCommandPutRequest = HTTP::Request::Common::POST( $sApiCommandUrl, 
+            {
+              'AcknowledgementCode'    => (CommandShutdown), ## Respond back with the exit code worker will set
+              'AcknowledgementMessage' => 'The system will shutdown shortly'
+            }
+          );
+          $oCommandPutRequest->method('PUT');
+          my $oCommandPutResponse = $oClient->request( $oCommandPutRequest );
+          $oLog->WriteLine('MaintenanceMain(): Server Response Code [ ' . $oCommandPutResponse->code() . ' ]');
+          
+          ## exit loop with exit code
+          $iReturn = CommandShutdown; ## Set the exit code which will be passed down to the launcher which will
+                                      ## Do the actual shutdown for us
+          last MAINTENANCELOOP;       ## Break out right now and stop processing the loop instructions
+        }
+        
+        ### --------------------------- Restart Command ---------------------------- ###
+        elsif( $oCommand->{TypeCode} == CommandRestart ){
+          $oLog->WriteLine('MaintenanceMain(): Processing [ Restart ] command.');
+          $oLog->WriteLine('MaintenanceMain(): Sending acknowledgement to the server.');
+          my $oCommandPutRequest = HTTP::Request::Common::POST( $sApiCommandUrl, 
+            {
+              'AcknowledgementCode'    => (CommandRestart), ## Respond back with the exit code worker will set
+              'AcknowledgementMessage' => 'The system will restart shortly'
+            }
+          );
+          $oCommandPutRequest->method('PUT');
+          my $oCommandPutResponse = $oClient->request( $oCommandPutRequest );
+          $oLog->WriteLine('MaintenanceMain(): Server Response Code [ ' . $oCommandPutResponse->code() . ' ]');
+          
+          ## exit loop with exit code
+          $iReturn = CommandRestart;  ## Set the exit code which will be passed down to the launcher which will
+                                      ## Do the actual shutdown for us
+          last MAINTENANCELOOP;       ## Break out right now and stop processing the loop instructions
+        }
+        
+        ### ----------------------------- Other Command ---------------------------- ###
+        ### This could be almost anything, it is a command line handed down from the
+        ### server which should be executed as a system call that can grab the exit
+        ### code and standard output for transmittion back to the server as the
+        ### acknowledgment of it being processed. this should be protected as much
+        ### as non-humanly possible to not let it fuck with the standard functionality
+        elsif( $oCommand->{TypeCode} == CommandExecute ){
+          $oLog->WriteLine('MaintenanceMain(): Processing [ Custom Execute ] command.');
+          $oLog->WriteLine('MaintenanceMain(): Command Body [ ' . $oCommand->{Body} . ' ]');
+          
+          my $iExitCode      = -1; ## Negative numbers are not valid in exit codes so this
+                                   ## will never be the result of a command being run
+          my @sProcessOutput = ();
+          
+          eval{
+            my $oProcessHandle;
+            my $iProcessId = open($oProcessHandle, $oCommand->{Body} . " |");
+            @sProcessOutput = <$oProcessHandle>;
+            
+            ## This is dangerous, if shit is fucked up it could block indefinitely
+            ## and the unit will stop getting new commands.
+            waitpid( $iProcessId, 0);
+            $iExitCode   = $? >> 8;
+            close($oProcessHandle);
+            
+            1;
+          }or do{
+            my $Exception = $@;
+            
+            
+          };
+          
+          ## I probably need to escape the shit out of the output before putting it back on the server
+          
+          $oLog->WriteLine('MaintenanceMain(): Sending acknowledgement to the server.');
+          my $oCommandPutRequest = HTTP::Request::Common::POST( $sApiCommandUrl, 
+            {
+              'AcknowledgementCode'    => $iExitCode, 
+              'AcknowledgementMessage' => join('', @sProcessOutput) ## does this already have returns on the EOL?
+            }
+          );
+          $oCommandPutRequest->method('PUT');
+          my $oCommandPutResponse = $oClient->request( $oCommandPutRequest );
+          $oLog->WriteLine('MaintenanceMain(): Server Response Code [ ' . $oCommandPutResponse->code() . ' ]');
+          
+        }
+        
+      }##next $oCommand
+    }
+    ### ---------------------------------------------------------------------------- ###
+    
+    
+    ### ---------------------------- Schedule Processing --------------------------- ###
+    $oLog->WriteLine('MaintenanceMain(): Passing schedule information to display thread.');
+    
+    ## Perl does not handle threading and objects together very well at all, need to map the response
+    ## from the server to a standard hashref before trying to pass it to the other thread otherwise
+    ## the data will all be junk.
+    if( defined($oInstructions->{Schedule}) ){
+      $ScheduleQueue->enqueue({
+        Sunday         => ($oInstructions->{Schedule}->{Sunday})? 1:0,
+        SundayStart    => $oInstructions->{Schedule}->{SundayStart},
+        SundayStop     => $oInstructions->{Schedule}->{SundayStop},
+        Monday         => ($oInstructions->{Schedule}->{Monday})? 1:0,
+        MondayStart    => $oInstructions->{Schedule}->{MondayStart},
+        MondayStop     => $oInstructions->{Schedule}->{MondayStop},
+        Tuesday        => ($oInstructions->{Schedule}->{Tuesday})? 1:0,
+        TuesdayStart   => $oInstructions->{Schedule}->{TuesdayStart},
+        TuesdayStop    => $oInstructions->{Schedule}->{TuesdayStop},
+        Wednesday      => ($oInstructions->{Schedule}->{Wednesday})? 1:0,
+        WednesdayStart => $oInstructions->{Schedule}->{WednesdayStart},
+        WednesdayStop  => $oInstructions->{Schedule}->{WednesdayStop},
+        Thursday       => ($oInstructions->{Schedule}->{Thursday})? 1:0,
+        ThursdayStart  => $oInstructions->{Schedule}->{ThursdayStart},
+        ThursdayStop   => $oInstructions->{Schedule}->{ThursdayStop},
+        Friday         => ($oInstructions->{Schedule}->{Friday})? 1:0,
+        FridayStart    => $oInstructions->{Schedule}->{FridayStart},
+        FridayStop     => $oInstructions->{Schedule}->{FridayStop},
+        Saturday       => ($oInstructions->{Schedule}->{Saturday})? 1:0,
+        SaturdayStart  => $oInstructions->{Schedule}->{SaturdayStart},
+        SaturdayStop   => $oInstructions->{Schedule}->{SaturdayStop}
+      }); 
+    }else{
+      $ScheduleQueue->enqueue( undef );
+    }
+    
+    foreach my $Thread (threads->list(threads::running)){
+      if( threads->tid() != $Thread->tid() ) { ## Don't signal yourself
+        $Thread->kill(SigScheduleReady);
+        threads->yield();
+      }
+      ## Send signal to all active threads to let them know a new task is in the queue for processing
+    }#next $Thread
+    
+    $oLog->WriteLine('MaintenanceMain(): Schedule information sent.');
+    ### ---------------------------------------------------------------------------- ###
+    
+    
+    ### -------------------------- Local Resource Cleanup -------------------------- ###
+    ### This needs to talk back to the server to get a list of active tasks for a terminal
+    ### (currently this is actually all terminals but is reported as a component)
+    eval{
+      $oLog->WriteLine('MaintenanceMain(): Getting a list of active tasks from the server for local resource management.');
+      my $oActiveTasksResponse = $oClient->get($MaintenanceApiUrlBase . $MaintenanceTerminalId . '/tasks');
+      if( $oActiveTasksResponse->code() != 200 ){
+        die('Invalid response from server, no data returned');
+      }
+      
+      if ( ! $oActiveTasksResponse->header('content-type') eq 'application/json') {
+        ## returned content is not in the expected format, exit here
+        die('server did not respond in a recognized format. type [ '. $oActiveTasksResponse->header('content-type') .' ]');
+      }
+    
+      my $oActiveTasks = JSON::decode_json( $oActiveTasksResponse->decoded_content() );
+      
+      $oLog->WriteLine('MaintenanceMain(): Getting a list of locally cached resource directories.');
+      my $hVarDirectory;
+      opendir($hVarDirectory, ApplicationVar);
+      if( ! defined( $hVarDirectory) ){
+        die('Failed in attempt to open directory handle to [ ' . ApplicationVar . ' ]');
+      }
+      my @LocalTaskFolders = readdir($hVarDirectory);
+      my %TaskFolders      = ();
+      
+      close($hVarDirectory);
+      undef($hVarDirectory);
+      
+      foreach my $LocalTaskFolder ( @LocalTaskFolders ){
+        if($LocalTaskFolder ne '.' && ( $LocalTaskFolder ne '..' ) ) { ## Ignore the current and parent directory markers
+          $TaskFolders{$LocalTaskFolder} = 0; ## Mark everything as deletable
+        }## not a directory marker
+      }##next $LocalTaskFolder
+      
+      $oLog->WriteLine('MaintenanceMain(): Marking inactive task resources for removal.');
+      ## This statement is actually backwards, everything has already been marked for removal and now
+      ## we are deciding what should be kept.
+      foreach my $ActiveTask ( @{$oActiveTasks} ){
+        $TaskFolders{$ActiveTask}      = 1; ## Mark it to be kept
+      }##next $ActiveTask
+      
+      $oLog->WriteLine('MaintenanceMain(): Removing inactive task resources to free up disk space.');
+      foreach my $TaskFolder ( keys(%TaskFolders) ){
+        if( $TaskFolders{$TaskFolder} == 0 && ( -d ApplicationVar . '/' . $TaskFolder ) ){
+          ## task folder is marked for deletion and it does exist, remove it
+          eval{
+            $oLog->WriteLine('MaintenanceMain(): Removing exired task [ ' . $TaskFolder . ' ] cached resources.');
+            File::Path::remove_tree( ApplicationVar . '/' . $TaskFolder );
+            $oLog->WriteLine('MaintenanceMain(): Expired task [ ' . $TaskFolder . ' ] cached resources removed.');
+            1;
+          }or do{
+            my $Exception = $@;
+            $oLog->WriteLine('MaintenanceMain(): Warning - failed to remove expired task [ ' . $TaskFolder . ' ] resource directory.');
+            $oLog->WriteLine('MaintenanceMain(): Message [ ' . $Exception . ' ]');
+          };
+        }## Inactive and exists
+        
+      }#next $TaskFolder
+      
+      $oLog->WriteLine('MaintenanceMain(): Locally cached resource cleanup complete.');
+      1;
+    }or do{
+      my $Exception = $@;
+      $oLog->WriteLine('MaintenanceMain(): Local resource cleanup failed.');
+      $oLog->WriteLine('MaintenanceMain(): Message [ ' . $Exception . ' ]');
+    };
+    ### ---------------------------------------------------------------------------- ###
+    
+    
+    ### --------------------------- Resource Processing ---------------------------- ###
+    my @sResources;       ## Array to hold resources that need to be tracked
+    my $bRefreshTask = 0; ## Indicates if a change took place that would require a refresh
+    
+    $oLog->WriteLine('MaintenanceMain(): Assigned Task [ ' . $oInstructions->{Task}->{Id} . ' ] Type [ ' . $oInstructions->{Task}->{Type} . ' ]');
+    
+    ### ----------------------- Tasks With Local Resources ------------------------- ###
+    if( $oInstructions->{Task}->{TypeId} == TaskSlideshow || $oInstructions->{Task}->{TypeId} == TaskVideo ){
+      $oLog->WriteLine('MaintenanceMain(): Processing resource list for assigned task');
+      my $sTargetFolder = ApplicationVar . '/' . $oInstructions->{Task}->{Id};
+      if ( ! -d $sTargetFolder ) {
+        $oLog->WriteLine('MaintenanceMain(): creating task directory for holding resources.');
+        File::Path::make_path( $sTargetFolder );
+      }
+      
+      ### ------------------------------- Resources -------------------------------- ###
+      foreach my $oResource ( @{ $oInstructions->{Task}->{Resources} } ){
+        $oLog->WriteLine('MaintenanceMain(): Resource [ ' . $oResource->{Uri} . ' ]');
+        my $sFilename = File::Basename::basename( $oResource->{Uri} );
+        $oLog->WriteLine('MaintenanceMain(): Filename [ ' . $sFilename . ' ]');
+        $oLog->WriteLine('MaintenanceMain():   Target [ ' . ($sTargetFolder . '/' . $sFilename) . ' ]');
+        
+        ### --------------------------- Resource Exists ---------------------------- ###
+        if ( -e $sTargetFolder . '/' . $sFilename ) {
+          $oLog->WriteLine('MaintenanceMain():   Resource exists locally, checking for changes.');
+          my $sResourceChecksum = MaintenanceGetResourceChecksum($sTargetFolder . '/' . $sFilename);
+          
+          $oLog->WriteLine('MaintenanceMain():   Expected Checksum [ ' . ($oResource->{Checksum} // 'Not Available') . ' ]');
+          $oLog->WriteLine('MaintenanceMain():     Actual Checksum [ ' . $sResourceChecksum . ' ]');
+          if( ! defined($oResource->{Checksum}) || ( $sResourceChecksum eq $oResource->{Checksum} ) ){
+            $oLog->WriteLine('MaintenanceMain():   No change detected, update not necessary.');
+            push(@sResources, $sTargetFolder . '/' . $sFilename);
+            next; #$oResource
+          }
+          
+          $oLog->WriteLine('MaintenanceMain():   Local resource does not match server copy, updating local copy.');
+        }## resource exists
+        ### ------------------------------------------------------------------------ ###
+        
+        
+        $oLog->WriteLine('MaintenanceMain():   Retreiving resource');
+        $oClient->get($oResource->{Uri}, ':content_file' => $sTargetFolder . '/' . $sFilename);
+        
+        my $sResourceChecksum = MaintenanceGetResourceChecksum($sTargetFolder . '/' . $sFilename);
+        
+        if( ! defined($oResource->{Checksum}) || ( $sResourceChecksum eq $oResource->{Checksum} ) ) {
+          push(@sResources, $sTargetFolder . '/' . $sFilename);
+          $bRefreshTask = 1; ## regardless of if it is new or not it needs to be sent to the display thread at this point
+        }else{
+          ## it did not download the resource correctly. log it and carry on i guess, it will try again on the next checkin
+          $oLog->WriteLine('MaintenanceMain():   Warning local file does not match server copy. retrieval failed');
+          unlink($sTargetFolder . '/' . $sFilename);
+          $oLog->WriteLine('MaintenanceMain():   Local copy removed');
+        }
+      }#next $oResource
+      ### -------------------------------------------------------------------------- ###
+    }## slideshow or video task type
+    
+    
+    ### --------------------- Tasks Without Local Resources ------------------------ ###
+    elsif( $oInstructions->{Task}->{TypeId} == TaskWebsite ){
+      $oLog->WriteLine('MaintenanceMain(): Processing resource for task.');
+      foreach my $oResource ( @{ $oInstructions->{Task}->{Resources} } ){
+        $oLog->WriteLine('MaintenanceMain(): Resource [ ' . $oResource->{Uri} . ' ]');
+        push(@sResources, $oResource->{Uri});
+      }#next $oResource
+    }
+    ### ---------------------------------------------------------------------------- ###
+    
+    
+    my $iCurrentTaskId = MaintenanceClientCurrentTaskId();
+    $oLog->WriteLine('MaintenanceMain(): Current Task Id [ ' . $iCurrentTaskId . ' ], Assigned Task Id [ ' . ($oInstructions->{Task}->{Id}) . ' ]');
+    ### @todo: this currently does not check the array to see if it is the same or not
+    if ( $oInstructions->{Task}->{Id} != $iCurrentTaskId || ( $bRefreshTask == 1 ) ) {
+      $oLog->WriteLine('MaintenanceMain(): Differences detected between assigned and current task, signalling display thread for change of task.');
+      $TaskQueue->enqueue({
+        TaskId        => $oInstructions->{Task}->{Id},
+        TaskType      => $oInstructions->{Task}->{TypeId},
+        TaskResources => \@sResources
+      });
+      foreach my $Thread (threads->list(threads::running)){
+        if( threads->tid() != $Thread->tid() ) { ## Don't signal yourself
+          $Thread->kill(SigTaskReady);
+          threads->yield();
+        }
+        ## Send signal to all active threads to let them know a new task is in the queue for processing
+      }#next $Thread  
+      
+      $oLog->WriteLine('MaintenanceMain(): Task information sent.');
+    }
+    
+  }continue{
+    $oLog->WriteLine('MaintenanceMain(): waiting [ ' . $MaintenanceCheckinInterval . ' ] seconds before next check in.');
+    sleep($MaintenanceCheckinInterval);
+    
+  }#while(1)
+  
+  
+  $oLog->WriteLine('MantenanceMain(): maintenance loop has ended, requesting that the display thread exit as well.');
+  foreach my $Thread (threads->list(threads::running)){
+    if( threads->tid() != $Thread->tid() ) { ## Don't signal yourself
+      $Thread->kill(SigExitRequest);
+      threads->yield();
+    }
+  }#next $Thread
+  
+  $oLog->WriteLine('MaintenanceMain(): exiting with code [ ' . $iReturn . ' ]');
+  return $iReturn;
+}
+### MaintenanceMain
+
+
+
+### [MaintenanceGetResourceChecksum]:
+###   Computes the checksum of the specified resource and returns the hex encoded result
+### Parameters:
+###   $sResourcePath: (string) Path to the resource for which a checksum is being requested
+### Return: (string)
+###   Hex encoded checksum of the specified file
+sub MaintenanceGetResourceChecksum { #( $sResourcePath )
+  my $sResourcePath = shift @_;
+  my $sChecksum     = undef;
+  my $oLog          = $MaintenanceLog;
+  
+  eval{
+    $oLog->WriteLine('MaintenanceGetResourceChecksum(): Computing checksum for local resource [ ' . $sResourcePath . ' ]');
+    if( ! -e $sResourcePath ){
+      die('File does not exit');
+    }
+    
+    my $hResourceFile = IO::File->new($sResourcePath,'r');
+    if( ! $hResourceFile ){
+      die('Failed to open file handle for resource');
+    }
+    
+    $hResourceFile->binmode();
+    
+    my $oMD5Digest = Digest::MD5->new();
+    
+    $oMD5Digest->addfile($hResourceFile);
+    
+    $sChecksum = $oMD5Digest->hexdigest();    
+    $oLog->WriteLine('MaintenanceGetResourceChecksum(): Computed Checksum [ ' . $sChecksum . ' ]');
+    
+    $hResourceFile->close();
+    undef($hResourceFile);
+    undef($oMD5Digest);
+    
+    1;
+  }or do{
+    my $e = $@;
+    chomp($e);
+    $oLog->WriteLine('MaintenanceGetResourceChecksum(): Error, failed to compute checksum');
+    $oLog->WriteLine('MaintenanceGetREsourceChecksum(): Message [ ' . $e . ' ]');
+  };
+  
+  return $sChecksum
+}
+### MaintenanceGetResourceChecksum
+
+
+
+### [MaintenanceClientVersion]
+###   Gets the current version of this client software
+###   This one seems kind of silly really, but it keeps the access method consistent
+### Return string
+sub MaintenanceClientVersion {
+  return $VERSION;
+}
+### MaintenanceClientVersion
+
+
+
+### [MaintenanceClientUptime]
+###   Gets the uptime of the system
+### Return integer
+sub MaintenanceClientUptime {
+  my $Value = undef;
+  
+  eval{
+    my $hProcUptime = IO::File->new('/proc/uptime', 'r');
+    if( defined($hProcUptime) ){
+      while(my $sLine = <$hProcUptime>){
+        $Value = (split(' ',$sLine))[0];
+      }
+      $hProcUptime->close();
+    }
+    undef($hProcUptime);
+    
+    1;
+  }or do{
+    ## not doing anything with failure at this point
+  };
+  
+  return $Value;
+}
+### MaintenanceClientUptime
+
+
+
+### [MaintenanceClientAvailableMemory]
+###   Gets the amount of free memory on the system (in KB)
+### Return integer
+sub MaintenanceClientAvailableMemory {
+  my $Value = undef;
+  
+  eval{
+    my $hProcMeminfo = IO::File->new('/proc/meminfo','r');
+    if( defined($hProcMeminfo) ){
+      while(my $sLine = <$hProcMeminfo>){
+        if($sLine =~ /^MemFree/){
+          $Value = (split(/\s+/,$sLine))[1];
+          last;
+        }
+      }
+      $hProcMeminfo->close();
+    }
+    undef($hProcMeminfo);
+    
+    1;
+  }or do{
+    ## not doing anything with failure at this point
+  };
+  
+  return $Value;
+}
+### MaintenanceClientAvailableMemory
+
+
+
+### [MaintenanceClientAvailableSpace]
+###   Gets the amount of free disk space on the system (in KB)
+### Return integer
+sub MaintenanceClientAvailableSpace {
+  my $Value = undef;
+  
+  eval{
+    foreach my $sLine ( `df -k` ){
+      if($sLine =~ /^rootfs/){
+        $Value = (split(/\s+/, $sLine))[3];
+        last;
+      }
+    }
+    
+    1;
+  }or do{
+    ## not doing anything with failure at this point
+  };
+  
+  return $Value;
+}
+### MaintenanceClientAvailableSpace
+
+
+
+### [MaintenanceClientWirelessQuality]
+###   Gets the current wireless signal quality rating (xx/70)
+### Return integer
+sub MaintenanceClientWirelessQuality {
+  my $Value = undef;
+  
+  eval{
+    my $hProcNetWireless = IO::File->new('/proc/net/wireless','r');
+    if( defined($hProcNetWireless) ){
+      while(my $sLine = <$hProcNetWireless>){
+        if($sLine =~ /^\s*wlan/){
+          $Value  = (split(/\s+/,$sLine))[3];
+          $Value  =~ s/\.$//; ## Strip trailing period
+          last;
+        }
+      }
+      $hProcNetWireless->close();
+    }
+    undef($hProcNetWireless);
+    
+    1;
+  }or do{
+    ## not doing anything with failure at this point
+  };
+  
+  return $Value;
+}
+### MaintenanceClientWirelessQuality
+
+
+
+### [MaintenanceClientWirelessStrength]
+###   Gets the current wireless signal strength measured in dB
+### Return integer (signed)
+sub MaintenanceClientWirelessStrength {
+  my $Value = undef;
+  
+  eval{
+    my $hProcNetWireless = IO::File->new('/proc/net/wireless','r');
+    if( defined($hProcNetWireless) ){
+      while(my $sLine = <$hProcNetWireless>){
+        if($sLine =~ /^\s*wlan/){
+          $Value = (split(/\s+/,$sLine))[4];
+          $Value =~ s/\.$//; ## Strip trailing period
+          last;
+        }
+      }
+      $hProcNetWireless->close();
+    }
+    undef($hProcNetWireless);
+    
+    1;
+  }or do{
+    ## not doing anything with failure at this point
+  };
+  
+  return $Value;
+}
+### MaintenanceClientWirelessStrength
+
+
+
+### [MaintenanceClientLocalAddress]
+###   Gets the internal network address of the client which may be
+###   needed for troubleshooting should something go wrong, i could walk them through
+###   either opening up the firewall to let port 22 out from it or take over a computer
+###   on the local network and get into it that way
+### Return string
+sub MaintenanceClientLocalAddress {
+  my $Value = undef;
+  
+  eval{
+    my @oInterfaces = IO::Interface::Simple->interfaces();
+    foreach my $oIf ( @oInterfaces ){
+      if( $oIf->is_running && ( ! $oIf->is_loopback ) ){
+        $Value = $oIf->address();
+        last;
+      }
+      
+    }#next $oIf
+    
+    1;
+  }or do{};
+  
+  return $Value;
+}
+### MaintenanceClientLocalAddress
+
+
+
+### [MaintenanceClientCurrentTaskId]
+###   Gets the Id of the currently active task the display thread is running
+### Return integer
+sub MaintenanceClientCurrentTaskId {
+  my $Value = -1;
+  my $oLog = $MaintenanceLog;
+  
+  $oLog->WriteLine('MaintenanceClientCurrentTaskId(): Requesting current task id from display thread.');
+  eval{
+    foreach my $Thread (threads->list(threads::running)){
+      if( threads->tid() != $Thread->tid() ) { ## Don't signal yourself
+        $Thread->kill(SigStatusRequest); ## Send signal to all active threads requesting the current task id
+        threads->yield();
+      }
+    }#next $Thread
+    
+    $oLog->WriteLine('MaintenanceClientCurrentTaskId(): Waiting on response for up to [ 60 ] seconds.');
+    ## Need to watch the queue without blocking for a period of time before giving up
+    ## This is because Maintenance can never become unresponsive otherwise it can't get new instructions
+    my $iTimeout = time + 60;
+    while( ! $CurrentTaskQueue->pending() && ( time < $iTimeout ) ){
+      threads->yield();
+    }#waiting
+    
+    ## If we fell out of the loop because something is waiting; get it, otherwise don't
+    if ( $CurrentTaskQueue->pending() ){
+      $Value = $CurrentTaskQueue->dequeue();
+      $oLog->WriteLine('MaintenanceClientCurrentTaskId(): Display thread responded with [ ' . $Value . ' ]');
+    }else{
+      $oLog->WriteLine('MaintenanceClientCurrentTaskId(): Warning - The display thread did not respond in the alotted timeframe.');
+    }
+    
+    1;
+  }or do{
+    ## not doing anything with failure at this point
+  };
+  
+  $oLog->WriteLine('MaintenanceClientCurrentTaskId(): Return value [ ' . $Value . ' ]');
+  return $Value;
+}
+### MaintenanceClientCurrentTaskId
+
+
+
+### [MaintenanceExitRequestHandler]:
+sub MaintenanceExitRequestHandler {
+  ## this will handle sig-term, if i set a flag for the main loop to pick up it will
+  ## potentially be several minutes before it sees it, that will be too long
+  ## so this needs to exit, what if it is in the middle of a checkin?
+  ## what all needs to be stopped for this to exit cleanly?
+  ## maybe certain tasks need to set a marker that they are in the middle of something
+  ## this could then wait on that to finish before closing, but if that is downloading
+  ## a huge file then it is going to run past the 5 seconds it is given in a shutdown
+  ## if this gets a signal to shut down do i need to worry about the display thread?
+  threads->exit(0);
+}
+### MaintenanceExitRequestHandler
+
+
+
+
+
+
+
+
+
+
+### -------------------------------------------------------------------------------- ###
+### -------------------------------- Display Thread -------------------------------- ###
+### -------------------------------------------------------------------------------- ###
+
+### ---------------------------- Thread Global Variables --------------------------- ###
+my $DisplayLog                = undef; ## (Object)      Holds the logging object passed in by the parent thread
+my $DisplayTaskId             = 0;     ## (Integer)     Holds the currently active tasks id
+my $DisplayTaskType           = 0;     ## (Integer)     Holds the currently active tasks type code
+my $DisplayTaskResources      = undef; ## (ArrayRef)    Holds an array reference of all resources used by the currently active task
+my $DisplayTaskProcessId      = undef; ## (Integer)     Holds the process id of the currently active task (needed for monitoring and cleanup)
+my $DisplayTaskProcessHandle  = undef; ## (File Handle) Holds the IO handle to the currently active task (needed for cleanup)
+my $DisplayTaskProcessMonitor = undef; ## (Object)      Holds the thread object spawned to monitor the currently active task process
+my $DisplayNewTaskInformation = undef; ## (HashRef)     Holds the instructions for a new task to be activated
+my $DisplaySchedule           = undef; ## (HashRef)     Holds the current powersave schedule information
+
+
+
+### [DisplayMain]:
+###   Display manager thread entry point
+sub DisplayMain { #( $oLog )
+  ### -------------------------- Thread Specific Includes -------------------------- ###
+  require Config::IniFiles;  Config::IniFiles->import(); ## Installed via cpan
+  
+  ### ----------------------- Thread Specific Event Handlers ----------------------- ###
+  $SIG{(SigExitRequest)}   = \&DisplayExitHandler;           ## Bind the event handler for exit requests
+  $SIG{(SigTaskReady)}     = \&DisplayTaskChangeHandler;     ## Bind the event handler for tasl change requests
+  $SIG{(SigScheduleReady)} = \&DisplayScheduleChangeHandler; ## Bind the event handler for schedule change requests
+  $SIG{(SigStatusRequest)} = \&DisplayStatusHandler;         ## Bind the event handler for display status requests
+  
+  
+  my $oLog    = shift @_;
+  my $iReturn = 1;
+  
+  ## This is used in the powersave determination but there is no reason to have it reinitialized continuously
+  my @DayOfWeek      = ('Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday');
+  
+  ## Store the logging object for use by functions in this thread
+  $DisplayLog      = $oLog; ## Other functions can access logging functionality now as well
+  $DisplayTaskId   = 0;     ## Set current task id to 0, not sure why but it is being stated as undef
+  $DisplaySchedule = undef; ## Set current task id to undef, not sure why but it is being stated as defined
+  
+  $oLog->WriteLine('DisplayMain(): Display thread started');
+  
+  ### ----------------------- Load Cached Task (If Available) ---------------------- ###
+  if( -e ApplicationEtc . '/task.ini' ){
+    $oLog->WriteLine('DisplayMain(): Cached task exists. Reading in task details.');
+    if( DisplayLoadCachedTaskDetails() ){
+      $oLog->WriteLine('DisplayMain(): Details loaded, resuming task from cache.');
+    }else{
+      $oLog->WriteLine('DisplayMain(): Warning - loading of cached task details failed.');
+    }
+  }
+  
+  
+  while (1) {
+    ### ----------------------- Powersaving Mode Evaluations ----------------------- ###
+    my $bPowersaveMode = 0;          ## Start from the prospect of there being no powersaving mode
+    my @CurrentTime    = localtime(time); ##($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst)
+    ## Turn the localtime information into something that can be compared to the schedule
+    my $iTimeOfDay     = 0+(sprintf('%02d',$CurrentTime[2]) . sprintf('%02d',$CurrentTime[1]) . sprintf('%02d',$CurrentTime[0]));
+    
+    if( defined($DisplaySchedule) ){ ## If a Schedule is defined the opposite applies, prove it should be awake
+      ### Setup the information about right now that needs to be assessed
+      $bPowersaveMode = 1; ## Each test tries to prove that it should be awake
+      
+      ## Check if today is on or off in the schedule
+      ## If it is off we can stop checking here, it should go to sleep
+      #$oLog->WriteLine('DisplayMain(): [ ' . $DayOfWeek[$CurrentTime[6]] . ' ] Enabled: [ ' . $DisplaySchedule->{$DayOfWeek[$CurrentTime[6]]} . ' ] Start: [ ' . $DisplaySchedule->{$DayOfWeek[$CurrentTime[6]] . 'Start'} . ' ] Stop: [ ' . $DisplaySchedule->{$DayOfWeek[$CurrentTime[6]] . 'Start'} . ' ]');
+      if( $DisplaySchedule->{$DayOfWeek[$CurrentTime[6]]} ){
+        
+        if( ! $DisplaySchedule->{$DayOfWeek[$CurrentTime[6]] . 'Start'} && ( ! $DisplaySchedule->{$DayOfWeek[$CurrentTime[6]] . 'Stop'} ) ){
+          $bPowersaveMode = 0; ## There are no times defined, it should be on
+        }##All Day Mode
+        
+        elsif( $iTimeOfDay > $DisplaySchedule->{$DayOfWeek[$CurrentTime[6]] . 'Start'} && ( $iTimeOfDay < $DisplaySchedule->{$DayOfWeek[$CurrentTime[6]] . 'Stop'} ) ){
+          $bPowersaveMode = 0; ## It should be awake if it is not already
+        }##Within Active Time Mode
+      }##Enbled Day
+    }
+    ### ---------------------------------------------------------------------------- ###
+    
+    
+    ### -------------------------- Set Powersaving State --------------------------- ###  
+    if( $bPowersaveMode ){ ### Powersaving should be in effect
+      if( ! DisplayGetPowersaveState() ){ ## The display is NOT currently in a powersave state
+        
+        if( defined($DisplayTaskProcessId) ){                   ## There is a task process running
+          $oLog->WriteLine('DisplayMain(): Entering powersave mode, shutting down task process.');
+          if( DisplayStopProcessById($DisplayTaskProcessId) ){ ## Stop it
+            if( DisplayJoinWaitingMonitorThread() ){            ## And join the monitor thread so it isn't hanging out needlessly
+              $oLog->WriteLine('DisplayMain(): Process monitor thread has joined. Task process is no longer running.');
+            }#Monitor thread joined
+            $DisplayTaskProcessId = undef;                      ## Clear out the value for the process id, its gone now
+          }#Process stopped
+          
+        }#Process exists
+        
+        $oLog->WriteLine('DisplayMain(): Setting display to powersave mode.');
+        DisplayEnterPowersaveState();
+      }#Not currently in powersave mode
+        
+      next; ## This will skip the part where it checks if the process is alive or not
+            ## As well as the part where it assigns a new task
+      
+    }else{ ### Powersaving should not be in effect
+      if( DisplayGetPowersaveState() ){ ## The display is currently in powersave state
+        $oLog->WriteLine('DisplayMain(): Waking up from powersave mode.');
+        DisplayExitPowersaveState();
+      }#Currently in powersave mode
+      
+    }
+    ### ---------------------------------------------------------------------------- ###
+    
+    
+    ### --------------------- New Task Information Evaluations --------------------- ###
+    if( defined($DisplayNewTaskInformation) ){ ## we have new instructions to process
+      $oLog->WriteLine('DisplayMain(): New task detected.');
+      $oLog->WriteLine('DisplayMain(): Current task [ ' . $DisplayTaskId . ' ]');
+      
+      if( defined($DisplayTaskProcessId) ) {
+        $oLog->WriteLine('DisplayMain(): Stopping process [ ' . $DisplayTaskProcessId . ' ] for current task');
+        if( DisplayStopProcessById($DisplayTaskProcessId) ){
+          $DisplayTaskProcessId = undef;
+        }
+      }
+      
+      $oLog->WriteLine('DisplayMain(): Storing details about new task.');
+      $DisplayTaskId        = $DisplayNewTaskInformation->{'TaskId'};
+      $oLog->WriteLine('DisplayMain():   Task Id [ ' . $DisplayNewTaskInformation->{'TaskId'} . ' ]');
+      
+      $DisplayTaskType      = $DisplayNewTaskInformation->{'TaskType'};
+      $oLog->WriteLine('DisplayMain(): Task Type [ ' . $DisplayNewTaskInformation->{'TaskType'} . ' ]');
+      
+      $DisplayTaskResources = $DisplayNewTaskInformation->{'TaskResources'};
+      $oLog->WriteLine('DisplayMain(): Task Resource Count [ ' . scalar(@{ $DisplayTaskResources }) . ' ]');
+      
+      ## reset, this is now the active task
+      $oLog->WriteLine('DisplayMain(): Resetting new task flag');
+      $DisplayNewTaskInformation = undef;
+    }
+    ### ---------------------------------------------------------------------------- ###
+    
+    ### ----------------------- Join Waiting Monitor Threads ----------------------- ###
+    ### This operates on the global variables for the thread and file handle
+    if( DisplayJoinWaitingMonitorThread() ){
+      $oLog->WriteLine('DisplayMain(): Process watcher thread has joined. Task process is no longer running.');
+      if( defined($DisplayTaskProcessHandle) ){
+        $oLog->WriteLine('DisplayMain(): Closing process handle. to free resources.');
+        close($DisplayTaskProcessHandle);
+        $DisplayTaskProcessHandle = undef;
+      }
+    }
+    ### ---------------------------------------------------------------------------- ###
+    
+    
+    ### ------------------------- Launch Task If Necessary ------------------------- ###
+    if( $DisplayTaskId && ( ! defined($DisplayTaskProcessId) || ! kill(0, $DisplayTaskProcessId) ) ){
+      $oLog->WriteLine('DisplayMain(): Process [ ' . ($DisplayTaskProcessId // 'Not Defined') . ' ] not running, spawning new task process.');
+      
+      if( $DisplayTaskType == TaskWebsite ){
+        $oLog->WriteLine('DisplayMain(): Starting new [ Website ] task');
+        $oLog->WriteLine('DisplayMain():   Target Address [ ' . @{ $DisplayTaskResources }[0] . ' ]');
+        #$DisplayTaskProcessId      = open($DisplayTaskProcessHandle, "midori -e Fullscreen --app=" . @{ $DisplayTaskResources }[0] . " |");
+		$DisplayTaskProcessId      = open($DisplayTaskProcessHandle, "chromium --allow-running-insecure-content --ignore-certificate-errors --kiosk --incognito " . @{ $DisplayTaskResources }[0] . " |");
+        $DisplayTaskProcessMonitor = threads->create(\&ProcessMonitorMain,$oLog,$DisplayTaskProcessId,$DisplayTaskType);
+      }
+      
+      elsif( $DisplayTaskType == TaskSlideshow ){
+        $oLog->WriteLine('DisplayMain(): Starting new [ Slideshow ] task');
+        $DisplayTaskProcessId      = open($DisplayTaskProcessHandle, "feh --fullscreen --hide-pointer --slideshow-delay 30 --sort filename " . join(' ',@{ $DisplayTaskResources }) . " |");
+        $DisplayTaskProcessMonitor = threads->create(\&ProcessMonitorMain,$oLog,$DisplayTaskProcessId,$DisplayTaskType);
+      }
+      
+      elsif( $DisplayTaskType == TaskVideo ){
+        $oLog->WriteLine('DisplayMain(): Starting new [ Video ] task');
+        $oLog->WriteLine('DisplayMain():   Video File [ ' . @{ $DisplayTaskResources }[0] . ' ]');
+        $DisplayTaskProcessId      = open($DisplayTaskProcessHandle, "/usr/bin/xterm -fullscreen -fg black -bg black -e /opt/omxplayer/usr/bin/omxplayer -o hdmi -r -L " . @{ $DisplayTaskResources }[0] . " |");
+        $DisplayTaskProcessMonitor = threads->create(\&ProcessMonitorMain,$oLog,$DisplayTaskProcessId,$DisplayTaskType);
+      }
+      $oLog->WriteLine('DisplayMain():   Process Id [ ' . ($DisplayTaskProcessId // 'Not Defined') . ' ]');
+      
+    }##process not running
+    ### ---------------------------------------------------------------------------- ###
+    
+    
+  }continue{
+    sleep(2);
+    #threads->yield(); ## 34% processor utilization vs 1.2% with sleep
+  }
+  
+  return $iReturn;
+}
+### DisplayMain
+
+
+
+### [DisplayStopCurrentTask]:
+###   Stops what ever task is running and resets the process id inidcator
+sub DisplayStopProcessById {
+  my $iProcessId = shift @_;
+  my $bReturn    = 0;
+  my $oLog       = $DisplayLog;
+  
+  if( $iProcessId && ( kill(0, $iProcessId) ) ){
+    $oLog->WriteLine('DisplayStopProcessById(): Stopping process [ ' . $iProcessId . ' ] for current task');
+    kill('TERM', $iProcessId);
+    waitpid($iProcessId, 0);
+    
+    if( defined($DisplayTaskProcessHandle) ){    
+      $oLog->WriteLine('DisplayStopProcessById(): Closing handle for process.');
+      close($DisplayTaskProcessHandle);
+      $DisplayTaskProcessHandle = undef; 
+    }
+    
+    $bReturn = 1;
+  }else{
+    $oLog->WriteLine("DisplayStopProcessById(): Specified process is already stopped.");
+  }
+  
+  return $bReturn;
+}
+### DisplayStopCurrentTask
+
+
+
+### [DisplayJoinWaitingMonitorThread]:
+###   Checks to see if the thread monitoring the task process is waiting to join
+###   Cleans up the file handle, though i don't know if that belongs here or not
+### Return: (Boolean)
+###   Indicates if a thread was joined
+sub DisplayJoinWaitingMonitorThread {
+  my $bReturn = 0;
+  
+  if( defined($DisplayTaskProcessMonitor) && ( $DisplayTaskProcessMonitor->is_joinable() ) ){
+    $DisplayTaskProcessMonitor->join();
+    $DisplayTaskProcessMonitor = undef;
+    $bReturn = 1;
+  }
+  
+  return $bReturn;
+}
+### DisplayJoinWaitingMonitorThread
+
+
+
+### [DisplayEnterPowersaveState]:
+###   Sends the HDMI command to put the display into a sleep state
+sub DisplayEnterPowersaveState {
+  system('tvservice -o');
+  return 1;
+}
+### DisplayEnterPowersaveState
+
+
+
+### [DisplayExitPowersaveState]:
+###   Sends the HDMI command to bring the display out of a sleep state
+###   And then triggered a settings change to cause the x session to wake up
+sub DisplayExitPowersaveState {
+  system('tvservice -p && fbset -depth 8 && fbset -depth 16');
+  return 1;
+}
+### DisplayExitPowersaveState
+
+
+
+### [DisplayGetPowersaveState]:
+###   Checks the HDMI signal to determine the current state of the display
+### Return: (boolean)
+###   0) Awake (Not in powersave)
+###   1) Sleeping
+sub DisplayGetPowersaveState {
+  my $iReturn = 0; ## not in power save state
+  
+  my $sTvserviceStatus = `tvservice -s`;
+  my $sStateCode = (split('\s+', $sTvserviceStatus))[1];
+  
+  if( $sStateCode eq '0x120002'){
+    #display is off
+    $iReturn = 1;
+  }
+  
+  return $iReturn;
+}
+### DisplayGetPowersaveState
+
+
+
+### [DisplayExitHandler]:
+###   Handles signals from the maintenance thread or parent thread asking to shut down
+### Note:
+###   This only sets the flag, DisplayMain is what processes and handles the shutdown request
+###   when it reaches the point of its loop where it checks for flags, this might take a couple seconds
+###   to go into effect.
+sub DisplayExitHandler {
+  my $oLog = $DisplayLog;
+  
+  $oLog->WriteLine('DisplayExitHandler(): Caught exit request signal, shutting down thread.');
+  if( defined($DisplayTaskProcessId) ){
+    $oLog->WriteLine('DisplayExitHandler(): Shutting down task process.');
+    DisplayStopProcessById( $DisplayTaskProcessId );
+    
+    $oLog->WriteLine('DisplayExitHandler(): Joining monitor thread.');
+    DisplayJoinWaitingMonitorThread(); ## what if it isn't ready yet? it should be
+  }
+  
+  $oLog->WriteLine('DisplayExitHandler(): Exiting.');
+  threads->exit();
+}
+### DisplayExit
+
+
+
+### [DisplayTaskChangeHandler]:
+###   Handles signals from the maintenance thread that a new task hash has been
+###   enqueued and is ready for consumption.
+sub DisplayTaskChangeHandler {
+  my $oLog = $DisplayLog;
+  
+  $oLog->WriteLine('DisplayTaskChangeHandler(): caught signal indicating instructions for a new task are waiting in the queue.');
+  $oLog->WriteLine('DisplayTaskChangeHandler(): retrieving information from queue');
+  
+  if( $TaskQueue->pending() ){
+    $DisplayNewTaskInformation = $TaskQueue->dequeue();
+    
+    $oLog->WriteLine('DisplayTaskChangeHandler(): Caching details about new task to disk.');
+    if( ! DisplayCacheTaskDetails() ){
+      $oLog->WriteLine('DisplayTaskChangeHandler(): Error - Failed to cache task details to disk.');
+    }
+    
+    
+    $oLog->WriteLine('DisplayTaskChangeHandler(): Setting flag to inform display processor of the new task');
+  }else{
+    $oLog->WriteLine('DisplayTaskChangeHandler(): Warning - no data in queue, it would seem someone got their signals crossed.');
+  }
+  
+  return 1;
+}
+### DisplayTaskChangeHandler
+
+
+
+### [DisplayScheduleChangeHandler]:
+###   Handles signals from the maintenance thread that a new schedule hash has been
+###   enqueued and is ready for consumption.
+sub DisplayScheduleChangeHandler {
+  my $oLog = $DisplayLog;
+  
+  $oLog->WriteLine('DisplayScheduleChangeHandler(): caught signal indicating a new powersave schedule is waiting in the queue.');
+  $oLog->WriteLine('DisplayScheduleChangeHandler(): retrieving information from queue');
+  
+  if( $ScheduleQueue->pending() ){
+    $oLog->WriteLine('DisplayScheduleChangeHandler(): Storing schedule information for use by display processor.');
+    $DisplaySchedule = $ScheduleQueue->dequeue();
+    
+    if( ! defined($DisplaySchedule) ){
+      $oLog->WriteLine('DisplayScheduleChangeHandler(): Note - schedule is empty, display will run in always-on mode.');
+    }
+  }else{
+    $oLog->WriteLine('DisplayScheduleChangeHandler(): Warning - no data in queue, it would seem someone got their signals crossed.');
+  }
+  return 1;
+}
+### DisplayScheduleChangeHandler
+
+
+
+### [DisplayStatusHandler]:
+###   Handles signals from the maintenance thread asking for the currently active task id
+###   by enqueuing the task
+###   previously sent a signal that it was queued, change to now just queue it, the requester
+###   will be listening now
+sub DisplayStatusHandler {
+  my $oLog = $DisplayLog;
+  
+  $oLog->WriteLine('DisplayStatusHandler(): Caught status query signal, queuing response');
+  $oLog->WriteLine('DisplayStatusHandler(): Current task id [ ' . $DisplayTaskId . ' ]');
+  $CurrentTaskQueue->enqueue( $DisplayTaskId );
+  
+  return 1;
+}
+### DisplayStatusHandler
+
+
+
+### [DisplayCacheTaskDetails]:
+###   Reads the task instructions stored in $DisplayNewTaskInformation and caches it to disk
+###   in the application etc directory as task.ini to allow for the task to be resumed right away
+###   after a restart or in the event of a loss of connection.
+### Return: (Boolean)
+###   Indicates if the caching operation was successful or not.
+sub DisplayCacheTaskDetails {
+  my $bReturn = 1;
+  my $oLog    = $DisplayLog;
+  
+  eval{
+    $oLog->WriteLine('DisplayCacheTaskDetails(): Caching task details for offline support.');
+    
+    my $oTaskIni = Config::IniFiles->new();
+    $oTaskIni->AddSection('Details');
+    $oTaskIni->newval('Details', 'Id', $DisplayNewTaskInformation->{'TaskId'});
+    $oTaskIni->newval('Details', 'Type', $DisplayNewTaskInformation->{'TaskType'});
+    $oTaskIni->newval('Details', 'Resources', @{ $DisplayNewTaskInformation->{'TaskResources'} });
+    $oTaskIni->WriteConfig( ApplicationEtc . '/task.ini' );
+    
+    $oLog->WriteLine('DisplayCacheTaskDetails(): Details cached.');
+    
+    1;
+  }or do{
+    my $Exception = $@;
+    $oLog->WriteLine('DisplayCacheTaskDetails(): Error! Failed to cache details to disk [ ' . $Exception . ' ]');
+    $bReturn = 0;
+    
+  };
+  
+  return $bReturn;
+}
+### DisplayCacheTaskDetails
+
+
+
+### [DisplayLoadCachedTaskDetails]:
+###   Reads the stored information from the task.ini file in the application etc directory
+###   if present, and populates the current task values from it to allow for resume from restart
+###   without having to check in with the server, which will get it back to doing its job faster
+###   and also allow for offline mode, both intentional and caused by failure.
+### Return: (Boolean)
+###   Indicates if task details were read from the file or not.
+sub DisplayLoadCachedTaskDetails {
+  my $oLog    = $DisplayLog;
+  my $bReturn = 0;
+  
+  $oLog->WriteLine('DisplayLoadCachedTaskDetails(): Checking for cached task information.');
+  
+  if( -e ApplicationEtc . '/task.ini' ){
+    eval{
+      $oLog->WriteLine('DisplayLoadCachedTaskDetails(): Loading cached task details from disk.');
+      my $oTaskIni = Config::IniFiles->new( -file => ApplicationEtc . '/task.ini' );
+      
+      my $iTaskId        = undef;
+      my $iTaskType      = undef;
+      my @sTaskResources = ();
+      
+      $iTaskId        = $oTaskIni->val('Details','Id');
+      $iTaskType      = $oTaskIni->val('Details','Type');
+      @sTaskResources = $oTaskIni->val('Details','Resources');
+      
+      if( defined($iTaskId) && ( defined($iTaskType) && ( @sTaskResources ) ) ){
+        $DisplayTaskId        = $iTaskId;
+        $oLog->WriteLine('DisplayLoadCachedTaskDetails(): Resumed Task Id [ ' . $iTaskId . ' ]');
+        $DisplayTaskType      = $iTaskType;
+        $oLog->WriteLine('DisplayLoadCachedTaskDetails(): Resumed Task Type [ ' . $iTaskType . ' ]');
+        $DisplayTaskResources = \@sTaskResources;
+        $oLog->WriteLine('DisplayLoadCachedTaskDetails(): Resumed Task Resource Count [ ' . scalar(@sTaskResources) . ']');
+        
+        $bReturn = 1;
+      }
+      
+      1;
+    }or do{
+      my $Exception = $@;
+      $bReturn      = 0;
+      $oLog->WriteLine('DisplayLoadCachedTaskDetails(): Failed to load cached task information [ ' . $Exception . ' ]');
+      
+    };  
+  }else{
+    $oLog->WriteLine('DisplayLoadCachedTaskDetails(): Cached task information not present. skipping load attempt.');
+  }
+  
+  return $bReturn;
+}
+### DisplayLoadCachedTaskDetails
+
+
+
+
+
+
+
+
+
+### -------------------------------------------------------------------------------- ###
+### ---------------------------- Process Monitor Thread ---------------------------- ###
+### -------------------------------------------------------------------------------- ###
+
+### [ProcessMonitorMain]:
+###   Waits on the provided process id for it to exit and then reclaims its resources
+###   so that it can be cleaned up properly and not leave defunct processes
+### Parameters:
+###   $oLog       : A logger object used to indicate what is happening within the thread.
+###   $iProcessId : The process id to wait on.
+sub ProcessMonitorMain { #( $oLog, $iProcessId, $iTaskType )
+  ### ----------------------- Thread Specific Event Handlers ----------------------- ###
+  $SIG{(SigExitRequest)}   = sub { return 1; };  ## Bind empty event handler for exit requests
+  $SIG{(SigTaskReady)}     = sub { return 1; };  ## Bind empty event handler for tasl change requests
+  $SIG{(SigScheduleReady)} = sub { return 1; };  ## Bind empty event handler for schedule change requests
+  $SIG{(SigStatusRequest)} = sub { return 1; };  ## Bind empty event handler for display status requests
+  
+  my $oLog       = shift @_;
+  my $iProcessId = shift @_;
+  my $iTaskType  = shift @_;
+  
+  $oLog->WriteLine('ProcessMonitorThread(): Waiting on process [ ' . $iProcessId . ' ]');
+  
+  waitpid($iProcessId,0);
+  
+  $oLog->WriteLine('ProcessMonitorThread(): Process has ended, cleaning up environment.');
+  if($iTaskType == TaskWebsite){
+    ## Kill any other running midori instances, it seems to change pids randomly
+	## Not needed when switched over to chromium
+    #system('killall midori');
+  }
+  elsif($iTaskType == TaskVideo){
+    ## Refresh the video state by switching the display on and off
+    ## Otherwise it is left looking like crap and a black screen on some displays
+    system('tvservice -o');
+    system('tvservice -p && fbset -depth 8 && fbset -depth 16');
+  }
+  
+  $oLog->WriteLine('ProcessMonitorThread(): Process reaped, rejoining parent.');
+  
+  threads->exit();
+}
+### ProcessMonitorMain
+
+1;
+__END__
