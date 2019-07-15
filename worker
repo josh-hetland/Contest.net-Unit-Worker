@@ -292,7 +292,7 @@ sub MaintenanceMain { #( $oLog, $iTerminalId )
         $oLog->WriteLine('MaintenanceMain(): Message: [ ' . $e . ' ]');
         $oLog->WriteLine('MaintenanceMain(): cleaning up local environment.');
         if( ! unlink(ApplicationBin . '/worker.new') ) {
-          $oLog->WriteLine('MaintenanceMain(): double shit... failed to delete the corrupt software update file, hopefully launcher will recover.');
+          $oLog->WriteLine('MaintenanceMain(): double bad... failed to delete the corrupt software update file, hopefully launcher will recover.');
           $oLog->WriteLine('MaintenanceMain(): Message: [ ' . $! . ' ]');
         }
         
@@ -380,7 +380,7 @@ sub MaintenanceMain { #( $oLog, $iTerminalId )
             my $iProcessId = open($oProcessHandle, $oCommand->{Body} . " |");
             @sProcessOutput = <$oProcessHandle>;
             
-            ## This is dangerous, if shit is fucked up it could block indefinitely
+            ## This is dangerous, if stuff is messed up it could block indefinitely
             ## and the unit will stop getting new commands.
             waitpid( $iProcessId, 0);
             $iExitCode   = $? >> 8;
@@ -393,7 +393,7 @@ sub MaintenanceMain { #( $oLog, $iTerminalId )
             
           };
           
-          ## I probably need to escape the shit out of the output before putting it back on the server
+          ## I probably need to escape the heck out of the output before putting it back on the server
           
           $oLog->WriteLine('MaintenanceMain(): Sending acknowledgement to the server.');
           my $oCommandPutRequest = HTTP::Request::Common::POST( $sApiCommandUrl, 
