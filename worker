@@ -42,7 +42,7 @@ use Thread::Queue;
 
 
 ### ------------------------------------ Exports ----------------------------------- ###
-our $VERSION = '1.0.0';
+our $VERSION = '1.0.2';
 
 
 
@@ -65,33 +65,48 @@ sub Main {
   
   my $iTerminalId = 0;
   my $iDebugMode  = 0;
+
+  my $EntryPoint  = 'https://api.contestnet.us/terminals/'; ## Default value if not set in conf file
   
   
   ### -------------------------- Parse Configuration File -------------------------- ###
-  eval{
+  eval
+  {
     my $hConfigurationFile = IO::File->new(ApplicationEtc . '/contestnet.conf','r');
-    if( defined($hConfigurationFile) ){
-      while(my $sLine = <$hConfigurationFile>){
+    if( defined($hConfigurationFile) )
+    {
+      while( my $sLine = <$hConfigurationFile> )
+      {
         chomp($sLine);    ## Remove carriage return
         $sLine =~ s/\s//; ## Strip any whitespace so we end up with a mashed key value pair or a line that starts with a #
-        if( $sLine !~ /^#/ && $sLine =~ /=/ ){ ## Only process lines that don't start with a comment and do have an = in them
+        if( $sLine !~ /^#/ && $sLine =~ /=/ )
+        { ## Only process lines that don't start with a comment and do have an = in them
           my @ConfigOption = split('=', $sLine);
           
           ### ---------------------------- Terminal Id ----------------------------- ###
-          if(lc($ConfigOption[0]) eq 'id'){
+          if( lc($ConfigOption[0]) eq 'id' )
+          {
             $iTerminalId = $ConfigOption[1];
           }
           
           ### ----------------------------- Debug Mode ----------------------------- ###
-          elsif(lc($ConfigOption[0]) eq 'debug'){
-            if(lc($ConfigOption[1]) eq 'true'){
+          elsif( lc($ConfigOption[0]) eq 'debug' )
+          {
+            if( lc($ConfigOption[1]) eq 'true' )
+            {
               $iDebugMode = 1;
             }
           }
-        }## None-comment key=value pair line
+
+          ### ---------------------------- Entry Point ----------------------------- ###
+          elsif( lc($ConfigOption[0]) eq 'api_entrypoint' )
+          {
+            $EntryPoint = $ConfigOption[1];
+          }
+        }
         
         
-      }##next $sLine
+      }
       $hConfigurationFile->close();
     }
     undef($hConfigurationFile);
@@ -115,7 +130,7 @@ sub Main {
   $CurrentTaskQueue = Thread::Queue->new(); ## Queue used by Display to pass current task information to Maintenance
   
   $oLog->WriteLine('Main(): Version [ ' . $VERSION . ' ] Spawning workers');
-  $oMaintenanceThread = threads->create(\&MaintenanceMain, $oLog, $iTerminalId);
+  $oMaintenanceThread = threads->create(\&MaintenanceMain, $oLog, $iTerminalId, $EntryPoint);
   $oDisplayThread     = threads->create(\&DisplayMain,     $oLog);
   
   ### Wait for the threads to end and then join them
@@ -163,7 +178,7 @@ my $MaintenanceCheckinInterval = 300;   ## Holds the number of seconds the maint
 
 ### [MaintenanceMain]:
 ###   Maintenance thread (background worker) entry point
-sub MaintenanceMain { #( $oLog, $iTerminalId )
+sub MaintenanceMain { #( $oLog, $iTerminalId, $EntryPoint )
   ### -------------------------- Thread Specific Includes -------------------------- ###
   require LWP::UserAgent;        LWP::UserAgent->import(); ## Installed via apt-get
   require HTTP::Request;         HTTP::Request->import();
@@ -184,6 +199,7 @@ sub MaintenanceMain { #( $oLog, $iTerminalId )
   
   $MaintenanceLog        = shift @_; ## Store the logger object in the thread global spot for other functions
   $MaintenanceTerminalId = shift @_; ## Store the terminal id in the thread global spot for other functions
+  $MaintenanceApiUrlBase = shift @_; ## Store the API entrypoint in the thread global spot for other function
   
   my $oLog    = $MaintenanceLog;     ## Get a local copy of the logger object for use in this function
   my $iReturn = 0;                   ## Set the default return value
@@ -196,8 +212,6 @@ sub MaintenanceMain { #( $oLog, $iTerminalId )
   ## It will always talk to the same server so it can probably only make the object once so long as there aren't any memory leaks
   my $oClient = LWP::UserAgent->new();
   $oClient->ssl_opts(verify_hostname => 0); ## Disables checking
-  
-  $MaintenanceApiUrlBase = 'https://api.contestnet.us/terminals/';
   
   $oLog->WriteLine('MaintenanceMain(): API Address [ ' . $MaintenanceApiUrlBase . $MaintenanceTerminalId . ' ]');
   $oLog->WriteLine('MaintenanceMain(): Beginning maintenace loop');
@@ -292,7 +306,7 @@ sub MaintenanceMain { #( $oLog, $iTerminalId )
         $oLog->WriteLine('MaintenanceMain(): Message: [ ' . $e . ' ]');
         $oLog->WriteLine('MaintenanceMain(): cleaning up local environment.');
         if( ! unlink(ApplicationBin . '/worker.new') ) {
-          $oLog->WriteLine('MaintenanceMain(): double bad... failed to delete the corrupt software update file, hopefully launcher will recover.');
+          $oLog->WriteLine('MaintenanceMain(): double shoot... failed to delete the corrupt software update file, hopefully launcher will recover.');
           $oLog->WriteLine('MaintenanceMain(): Message: [ ' . $! . ' ]');
         }
         
@@ -366,7 +380,7 @@ sub MaintenanceMain { #( $oLog, $iTerminalId )
         ### server which should be executed as a system call that can grab the exit
         ### code and standard output for transmittion back to the server as the
         ### acknowledgment of it being processed. this should be protected as much
-        ### as non-humanly possible to not let it fuck with the standard functionality
+        ### as non-humanly possible to not let it mess with the standard functionality
         elsif( $oCommand->{TypeCode} == CommandExecute ){
           $oLog->WriteLine('MaintenanceMain(): Processing [ Custom Execute ] command.');
           $oLog->WriteLine('MaintenanceMain(): Command Body [ ' . $oCommand->{Body} . ' ]');
