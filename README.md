@@ -7,9 +7,9 @@ These units run in remote locations that are time consuming to reach, so emphasi
 
 
 This project is broken into three repositories
-* Configuration
-* Launcher
-* Worker _(this one)_
+* [Configuration](https://github.com/josh-hetland/Contest.net-Unit-Configuration)
+* [Launcher](https://github.com/josh-hetland/Contest.net-Unit-Launcher)
+* [Worker](https://github.com/josh-hetland/Contest.net-Unit-Worker) _(this one)_
 
 
 The Worker is the main process that runs on the client to coordinate activities. It is bundled as a single file to simplify the delivery and validation
