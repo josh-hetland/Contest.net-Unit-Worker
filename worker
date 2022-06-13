@@ -1117,8 +1117,12 @@ sub DisplayMain { #( $oLog )
       if( $DisplayTaskType == TaskWebsite ){
         $oLog->WriteLine('DisplayMain(): Starting new [ Website ] task');
         $oLog->WriteLine('DisplayMain():   Target Address [ ' . @{ $DisplayTaskResources }[0] . ' ]');
-        #$DisplayTaskProcessId      = open($DisplayTaskProcessHandle, "midori -e Fullscreen --app=" . @{ $DisplayTaskResources }[0] . " |");
-		$DisplayTaskProcessId      = open($DisplayTaskProcessHandle, "chromium --allow-running-insecure-content --ignore-certificate-errors --kiosk --incognito " . @{ $DisplayTaskResources }[0] . " |");
+        my $DisplayTaskWebService = 'chromium';
+        if( -e '/usr/bin/chromium-browser' )
+        { # Short term support for both the old and new browser command names (same browser)
+          $DisplayTaskWebService = 'chromium-browser';
+        }
+		    $DisplayTaskProcessId      = open($DisplayTaskProcessHandle, $DisplayTaskWebService . " --allow-running-insecure-content --ignore-certificate-errors --kiosk --incognito " . @{ $DisplayTaskResources }[0] . " |");
         $DisplayTaskProcessMonitor = threads->create(\&ProcessMonitorMain,$oLog,$DisplayTaskProcessId,$DisplayTaskType);
       }
       
@@ -1131,7 +1135,14 @@ sub DisplayMain { #( $oLog )
       elsif( $DisplayTaskType == TaskVideo ){
         $oLog->WriteLine('DisplayMain(): Starting new [ Video ] task');
         $oLog->WriteLine('DisplayMain():   Video File [ ' . @{ $DisplayTaskResources }[0] . ' ]');
-        $DisplayTaskProcessId      = open($DisplayTaskProcessHandle, "/usr/bin/xterm -fullscreen -fg black -bg black -e /opt/omxplayer/usr/bin/omxplayer -o hdmi -r -L " . @{ $DisplayTaskResources }[0] . " |");
+        if( -e '/usr/bin/cvlc' )
+        { # New video player for bullseye systems
+          $DisplayTaskProcessId = open($DisplayTaskProcessHandle, "cvlc --loop --fullscreen --no-osd " . @{ $DisplayTaskResources }[0] . " |");
+        }
+        else
+        { # Old video player for jessie systems (should be gone soon)
+          $DisplayTaskProcessId = open($DisplayTaskProcessHandle, "/usr/bin/xterm -fullscreen -fg black -bg black -e /opt/omxplayer/usr/bin/omxplayer -o hdmi -r -L " . @{ $DisplayTaskResources }[0] . " |");
+        }
         $DisplayTaskProcessMonitor = threads->create(\&ProcessMonitorMain,$oLog,$DisplayTaskProcessId,$DisplayTaskType);
       }
       $oLog->WriteLine('DisplayMain():   Process Id [ ' . ($DisplayTaskProcessId // 'Not Defined') . ' ]');
